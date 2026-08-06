@@ -1,5 +1,9 @@
 # opencode-db-prune
 
+*[Versión en español](LEEME.md)*
+
+> **This version is tested on macOS only.** See [Platforms](#platforms).
+
 Your `opencode.db` is probably enormous, and probably 90 % of it is one table
 you don't need.
 
@@ -101,19 +105,37 @@ No dependencies. Python 3.8+.
   nothing was lost.
 - Enables `auto_vacuum = INCREMENTAL` so future growth stays reclaimable.
 
-## Where it looks for the database
+## Platforms
 
-| Platform | Path |
-|---|---|
-| Linux | `$XDG_DATA_HOME/opencode/opencode.db`, `~/.local/share/opencode/opencode.db` |
-| macOS | `~/.local/share/opencode/opencode.db`, `~/Library/Application Support/opencode/opencode.db` |
-| Windows | `%LOCALAPPDATA%\opencode\opencode.db`, `%APPDATA%\opencode\opencode.db` |
+**Tested on macOS only.** That is where the problem was found, measured, and
+where the result was verified.
 
-If several exist, it picks the largest — that's the one with the problem. Or
-pass `--db` explicitly.
+The code does include path detection and an in-use check for Linux and Windows,
+but **nobody has exercised those yet**:
 
-Developed and tested on macOS. Path and lock detection for Linux and Windows
-are implemented but less exercised; reports welcome.
+| Platform | Status | Paths |
+|---|---|---|
+| macOS | **tested** | `~/.local/share/opencode/opencode.db`, `~/Library/Application Support/opencode/opencode.db` |
+| Linux | written, untested | `$XDG_DATA_HOME/opencode/opencode.db`, `~/.local/share/opencode/opencode.db` |
+| Windows | written, untested | `%LOCALAPPDATA%\opencode\opencode.db`, `%APPDATA%\opencode\opencode.db` |
+
+If several databases exist, the largest is picked — that's the one with the
+problem. You can always bypass detection with `--db /path/to/opencode.db`.
+
+### Contributions for Linux and Windows are welcome
+
+If you hit the same problem on another platform and want to improve that part,
+the most useful things are:
+
+- Confirm where OpenCode actually keeps the database on your system.
+- Check the "file in use" detection. On Windows it works by trying to open the
+  file for writing, which is an approximation and may misreport; on Linux it
+  shells out to `lsof`, which is not always installed.
+- Say whether your numbers look like these, or whether the breakdown of the
+  `event` table is different on your setup.
+
+Opening an issue with the output of the report (the command without `--apply`,
+which changes nothing) is enough. Pull requests welcome.
 
 ## How this differs from a VACUUM
 
@@ -139,30 +161,9 @@ update, or prune the change feed when a session completes. Until then, this.
 
 ---
 
-## En español
+## Español
 
-Tu `opencode.db` probablemente pesa muchísimo, y lo más probable es que el 90 %
-sea una sola tabla que no necesitas.
-
-**El motivo:** OpenCode guarda una copia completa del mensaje **cada vez que lo
-actualiza**. Mientras una respuesta se va escribiendo, eso ocurre muchas veces, y
-cada copia arrastra el texto acumulado entero. En una instalación real: 39 GB de
-base, de los cuales 35 GB eran esas copias y solo 3 GB las conversaciones.
-
-**Por qué se puede borrar:** el contenido definitivo vive en las tablas
-`message` y `part` — el script lo comprueba antes de tocar nada, abriendo la
-sesión más antigua y verificando que su texto siga ahí. Y el propio OpenCode
-borra esa tabla en una de sus migraciones, sin tocar `session`, `message` ni
-`part`.
-
-**No borra sesiones, ni mensajes, ni archivos.** Solo eventos redundantes.
-
-```bash
-python3 opencode-db-prune.py            # informe, no toca nada
-python3 opencode-db-prune.py --apply    # limpia, respaldando antes
-```
-
-Cierra OpenCode antes de ejecutarlo.
+Hay una versión completa en español: **[LEEME.md](LEEME.md)**.
 
 ## License
 

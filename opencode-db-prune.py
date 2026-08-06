@@ -71,8 +71,11 @@ Usage:
     python3 opencode-db-prune.py --apply         # prune, with a backup first
     python3 opencode-db-prune.py --apply --no-backup --keep 10
 
-Requires only the Python standard library. Tested on macOS; path and lock
-detection also implemented for Linux and Windows.
+Requires only the Python standard library.
+
+Tested on macOS only. Path detection and the in-use check for Linux and Windows
+are written but unverified — if you run it there, contributions confirming or
+fixing them are welcome. You can always bypass detection with --db.
 """
 import argparse
 import os
