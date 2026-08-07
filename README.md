@@ -88,6 +88,13 @@ python3 opencode-db-prune.py --apply --keep 20        # leave 20 newest sessions
 python3 opencode-db-prune.py --db /path/to/opencode.db
 ```
 
+On Windows, the Python launcher works too:
+
+```powershell
+py opencode-db-prune.py
+py opencode-db-prune.py --apply
+```
+
 **Quit OpenCode first.** The script checks whether the file is open and refuses
 to run if it is.
 
@@ -110,14 +117,15 @@ No dependencies. Python 3.8+.
 **Tested on macOS only.** That is where the problem was found, measured, and
 where the result was verified.
 
-The code does include path detection and an in-use check for Linux and Windows,
-but **nobody has exercised those yet**:
+Linux support is written but untested. Windows now follows OpenCode's documented
+data directory and uses the native Windows file-sharing API for the in-use
+safeguard, but it still needs field confirmation on a real Windows installation:
 
 | Platform | Status | Paths |
 |---|---|---|
 | macOS | **tested** | `~/.local/share/opencode/opencode.db`, `~/Library/Application Support/opencode/opencode.db` |
 | Linux | written, untested | `$XDG_DATA_HOME/opencode/opencode.db`, `~/.local/share/opencode/opencode.db` |
-| Windows | written, untested | `%LOCALAPPDATA%\opencode\opencode.db`, `%APPDATA%\opencode\opencode.db` |
+| Windows | implemented, needs field confirmation | `%USERPROFILE%\.local\share\opencode\opencode.db` |
 
 If several databases exist, the largest is picked — that's the one with the
 problem. You can always bypass detection with `--db /path/to/opencode.db`.
@@ -128,9 +136,9 @@ If you hit the same problem on another platform and want to improve that part,
 the most useful things are:
 
 - Confirm where OpenCode actually keeps the database on your system.
-- Check the "file in use" detection. On Windows it works by trying to open the
-  file for writing, which is an approximation and may misreport; on Linux it
-  shells out to `lsof`, which is not always installed.
+- Check the "file in use" detection. On Windows it requests an exclusive handle
+  with `CreateFileW`; on Linux it shells out to `lsof`, which is not always
+  installed.
 - Say whether your numbers look like these, or whether the breakdown of the
   `event` table is different on your setup.
 

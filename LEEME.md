@@ -89,6 +89,13 @@ python3 opencode-db-prune.py --apply --keep 20        # deja intactas las 20 má
 python3 opencode-db-prune.py --db /ruta/a/opencode.db
 ```
 
+En Windows también puedes usar el lanzador de Python:
+
+```powershell
+py opencode-db-prune.py
+py opencode-db-prune.py --apply
+```
+
 **Cierra OpenCode antes.** El script comprueba si el archivo está abierto y se
 niega a ejecutarse si lo está.
 
@@ -112,23 +119,24 @@ Sin dependencias. Python 3.8 o superior.
 **Probado únicamente en macOS.** Es donde se encontró el problema, donde se midió
 y donde se verificó el resultado.
 
-El código incluye la detección de rutas para Linux y Windows y una forma de
-comprobar si el archivo está en uso en cada sistema, **pero nadie las ha probado
-todavía**:
+El soporte para Linux está escrito pero sin probar. Windows ahora sigue la ruta
+de datos documentada por OpenCode y usa la API nativa de archivos de Windows
+para la salvaguarda que detecta si la base está en uso, aunque todavía necesita
+confirmación en una instalación real de Windows:
 
 | Sistema | Estado | Rutas |
 |---|---|---|
 | macOS | **probado** | `~/.local/share/opencode/opencode.db`, `~/Library/Application Support/opencode/opencode.db` |
 | Linux | escrito, sin probar | `$XDG_DATA_HOME/opencode/opencode.db`, `~/.local/share/opencode/opencode.db` |
-| Windows | escrito, sin probar | `%LOCALAPPDATA%\opencode\opencode.db`, `%APPDATA%\opencode\opencode.db` |
+| Windows | implementado, pendiente de confirmación | `%USERPROFILE%\.local\share\opencode\opencode.db` |
 
 Si te topaste con el mismo problema en Linux o en Windows y quieres mejorar esa
 parte, **las contribuciones son bienvenidas**. Lo que más ayuda:
 
 - Confirmar dónde guarda OpenCode la base en tu sistema.
-- Comprobar la detección de «archivo en uso». En Windows se hace intentando abrir
-  el archivo en modo escritura, que es una aproximación y puede fallar; en Linux
-  se usa `lsof`, que no siempre está instalado.
+- Comprobar la detección de «archivo en uso». En Windows solicita un handle
+  exclusivo mediante `CreateFileW`; en Linux se usa `lsof`, que no siempre está
+  instalado.
 - Decir si las cifras se parecen a las de aquí o si el reparto de la tabla
   `event` es distinto.
 

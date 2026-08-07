@@ -73,9 +73,10 @@ Usage:
 
 Requires only the Python standard library.
 
-Tested on macOS only. Path detection and the in-use check for Linux and Windows
-are written but unverified — if you run it there, contributions confirming or
-fixing them are welcome. You can always bypass detection with --db.
+Tested on macOS only. Linux support is written but unverified. Windows path
+detection follows OpenCode's documented data directory and its in-use check uses
+the native Windows file-sharing API. Field confirmation on Windows is welcome.
+You can always bypass detection with --db.
 """
 import argparse
 import os
@@ -99,25 +100,73 @@ def human(n):
 def find_database():
     """Locate OpenCode's database on macOS, Linux or Windows.
 
-    OpenCode follows each platform's data-directory convention, so the path
-    differs. Every candidate is tried; if several exist, the largest one wins,
-    because that is the one with the problem.
+    OpenCode stores its data under ~/.local/share/opencode on Windows too.
+    Every candidate is tried; if several exist, the largest one wins, because
+    that is the one with the problem.
     """
     candidates = []
     xdg = os.environ.get("XDG_DATA_HOME")
     if xdg:
         candidates.append(os.path.join(xdg, "opencode", "opencode.db"))
-    candidates += [
-        os.path.expanduser("~/.local/share/opencode/opencode.db"),
-        os.path.expanduser("~/Library/Application Support/opencode/opencode.db"),
-    ]
-    for var in ("LOCALAPPDATA", "APPDATA"):
-        base = os.environ.get(var)
-        if base:
-            candidates.append(os.path.join(base, "opencode", "opencode.db"))
+    candidates.append(os.path.expanduser("~/.local/share/opencode/opencode.db"))
+    if sys.platform == "darwin":
+        candidates.append(
+            os.path.expanduser("~/Library/Application Support/opencode/opencode.db"))
 
     existing = [c for c in dict.fromkeys(candidates) if os.path.exists(c)]
     return max(existing, key=os.path.getsize) if existing else None
+
+
+def windows_file_in_use(path):
+    """Check whether a Windows process already has the database open.
+
+    Requesting an exclusive handle (share mode 0) conflicts with any existing
+    handle that is actively reading or writing the file. That makes this check
+    stricter than Python's normal open(), whose sharing flags are not suitable
+    for detecting SQLite usage.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    GENERIC_READ = 0x80000000
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x80
+    ERROR_SHARING_VIOLATION = 32
+    ERROR_LOCK_VIOLATION = 33
+    INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateFileW(
+        path,
+        GENERIC_READ,
+        0,
+        None,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if handle == INVALID_HANDLE_VALUE:
+        error = ctypes.get_last_error()
+        if error in (ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION):
+            return True
+        return None
+
+    kernel32.CloseHandle(handle)
+    return False
 
 
 def database_in_use(path):
@@ -133,11 +182,7 @@ def database_in_use(path):
     """
     try:
         if os.name == "nt":
-            try:
-                with open(path, "r+b"):
-                    return False
-            except PermissionError:
-                return True
+            return windows_file_in_use(path)
         result = subprocess.run(["lsof", "--", path],
                                 capture_output=True, text=True)
         return bool(result.stdout.strip())
@@ -199,8 +244,8 @@ def main():
     db = args.db or find_database()
     if not db or not os.path.exists(db):
         print("Could not find opencode.db. Tried $XDG_DATA_HOME/opencode,\n"
-              "~/.local/share/opencode, ~/Library/Application Support/opencode,\n"
-              "%LOCALAPPDATA%/opencode and %APPDATA%/opencode.\n"
+              "~/.local/share/opencode (including %USERPROFILE%\\.local\\share\\opencode on Windows),\n"
+              "and ~/Library/Application Support/opencode on macOS.\n"
               "Pass the path explicitly with --db.")
         return 1
 
