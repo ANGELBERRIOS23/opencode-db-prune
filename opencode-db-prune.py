@@ -104,6 +104,12 @@ def find_database():
     Every candidate is tried; if several exist, the largest one wins, because
     that is the one with the problem.
     """
+    # OPENCODE_DB gana sobre todo lo demás: si el usuario movió la base a otro
+    # disco, ninguna heurística de rutas va a encontrarla.
+    override = os.environ.get("OPENCODE_DB")
+    if override and os.path.exists(override):
+        return override
+
     candidates = []
     xdg = os.environ.get("XDG_DATA_HOME")
     if xdg:
@@ -112,6 +118,16 @@ def find_database():
     if sys.platform == "darwin":
         candidates.append(
             os.path.expanduser("~/Library/Application Support/opencode/opencode.db"))
+    # En Windows la CLI usa ~/.local/share, pero la aplicación de escritorio
+    # guarda bajo %LOCALAPPDATA%\opencode\data. Se prueban las dos: como abajo
+    # se elige la mayor de las que existan, tener candidatas de más no cuesta
+    # nada, y quitarlas dejaría fuera a quien use el escritorio.
+    if os.name == "nt":
+        for var in ("LOCALAPPDATA", "APPDATA"):
+            base = os.environ.get(var)
+            if base:
+                candidates.append(os.path.join(base, "opencode", "data", "opencode.db"))
+                candidates.append(os.path.join(base, "opencode", "opencode.db"))
 
     existing = [c for c in dict.fromkeys(candidates) if os.path.exists(c)]
     return max(existing, key=os.path.getsize) if existing else None
@@ -243,9 +259,10 @@ def main():
 
     db = args.db or find_database()
     if not db or not os.path.exists(db):
-        print("Could not find opencode.db. Tried $XDG_DATA_HOME/opencode,\n"
-              "~/.local/share/opencode (including %USERPROFILE%\\.local\\share\\opencode on Windows),\n"
-              "and ~/Library/Application Support/opencode on macOS.\n"
+        print("Could not find opencode.db. Tried $OPENCODE_DB, $XDG_DATA_HOME/opencode,\n"
+              "~/.local/share/opencode (%USERPROFILE%\\.local\\share\\opencode on Windows),\n"
+              "~/Library/Application Support/opencode on macOS, and on Windows also\n"
+              "%LOCALAPPDATA%/opencode/data and %APPDATA%/opencode.\n"
               "Pass the path explicitly with --db.")
         return 1
 

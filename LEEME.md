@@ -128,7 +128,7 @@ confirmación en una instalación real de Windows:
 |---|---|---|
 | macOS | **probado** | `~/.local/share/opencode/opencode.db`, `~/Library/Application Support/opencode/opencode.db` |
 | Linux | escrito, sin probar | `$XDG_DATA_HOME/opencode/opencode.db`, `~/.local/share/opencode/opencode.db` |
-| Windows | implementado, pendiente de confirmación | `%USERPROFILE%\.local\share\opencode\opencode.db` |
+| Windows | implementado, pendiente de confirmación | `%USERPROFILE%\.local\share\opencode\opencode.db` (CLI), `%LOCALAPPDATA%\opencode\data\opencode.db` (app de escritorio) |
 
 Si te topaste con el mismo problema en Linux o en Windows y quieres mejorar esa
 parte, **las contribuciones son bienvenidas**. Lo que más ayuda:
@@ -143,7 +143,9 @@ parte, **las contribuciones son bienvenidas**. Lo que más ayuda:
 Basta con abrir un *issue* con la salida del informe (el comando sin `--apply`,
 que no cambia nada) o mandar un *pull request*.
 
-En cualquier sistema puedes saltarte la detección con `--db /ruta/al/archivo`.
+Si existen varias bases, se elige la mayor. Se respeta `OPENCODE_DB`, que gana
+sobre todo lo demás, y en cualquier sistema puedes saltarte la detección con
+`--db /ruta/al/archivo`.
 
 ## En qué se diferencia de un VACUUM
 

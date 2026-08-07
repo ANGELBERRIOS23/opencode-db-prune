@@ -125,10 +125,11 @@ safeguard, but it still needs field confirmation on a real Windows installation:
 |---|---|---|
 | macOS | **tested** | `~/.local/share/opencode/opencode.db`, `~/Library/Application Support/opencode/opencode.db` |
 | Linux | written, untested | `$XDG_DATA_HOME/opencode/opencode.db`, `~/.local/share/opencode/opencode.db` |
-| Windows | implemented, needs field confirmation | `%USERPROFILE%\.local\share\opencode\opencode.db` |
+| Windows | implemented, needs field confirmation | `%USERPROFILE%\.local\share\opencode\opencode.db` (CLI), `%LOCALAPPDATA%\opencode\data\opencode.db` (desktop app) |
 
 If several databases exist, the largest is picked — that's the one with the
-problem. You can always bypass detection with `--db /path/to/opencode.db`.
+problem. `OPENCODE_DB` is honoured and wins over everything else. You can also
+bypass detection entirely with `--db /path/to/opencode.db`.
 
 ### Contributions for Linux and Windows are welcome
 
