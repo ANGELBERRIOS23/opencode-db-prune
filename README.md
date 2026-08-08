@@ -2,26 +2,49 @@
 
 *[Versión en español](LEEME.md)*
 
-> **This version is tested on macOS only.** See [Platforms](#platforms).
+> **Tested on macOS.** Linux written, Windows implemented. See [Platforms](#platforms).
 
-Your `opencode.db` is probably enormous, and probably 90 % of it is one table
+Your `opencode.db` is probably enormous, and probably 90% of it is one table
 you don't need.
 
 This is a single-file Python script, standard library only, that reclaims it —
 without deleting a single session, message or file part.
 
 ```
-database : /home/you/.local/share/opencode/opencode.db
-size     : 39.37 GB
+============================================================
+ opencode-db-prune v2.0.0
+============================================================
 
-event table: 953,214 rows, 35.42 GB
-  message.updated.1            228,444    33.87 GB
-  message.part.updated.1       659,569     1.51 GB
-  session.updated.1             63,095     0.05 GB
+  database : /home/you/.local/share/opencode/opencode.db
+  size     : 39.37 GB
 
-would prune (all but the 5 newest sessions): 949,404 rows, 35.42 GB
-estimated size afterwards: ~3.96 GB
+  ────────────────────────────────────────────────────────
+  Event table: 953,214 rows, 35.42 GB
+  ────────────────────────────────────────────────────────
+    message.updated.1                228,444    33.87 GB  (95.6%)
+    message.part.updated.1           659,569     1.51 GB  (4.3%)
+    session.updated.1                 63,095     0.05 GB  (0.1%)
+  ────────────────────────────────────────────────────────
+  Byte-identical duplicates: 412,003 rows, 12.80 GB (43.2% of events)
+
+  Would prune: 949,404 rows, 35.42 GB
+  Estimated size after: ~3.96 GB
 ```
+
+## What's new in v2.0
+
+| Feature | Description |
+|---------|-------------|
+| **Incremental batched deletion** | Safe for 50+ GB databases — no journal overflow risk |
+| **Smart deduplication analysis** | Detects byte-identical consecutive snapshots (e.g., `wget --show-progress` generating 39,000 copies of the same 31 KB) |
+| **Per-session targeting** | `--session <id>` to prune a single problematic session |
+| **Sync/workspace awareness** | Won't touch aggregates owned by sync consumers |
+| **Tool-output cleanup** | `--tool-output` reclaims the other big consumer (up to 45 GB) |
+| **Quick stats** | `--stats` for instant diagnostics without full table scans |
+| **Real-time progress** | Progress bars during large deletions |
+| **Schedule mode** | `--schedule 6h` for unattended periodic maintenance |
+| **Post-prune verification** | Random session sampling confirms content integrity |
+| **Version flag** | `--version` |
 
 ## What is actually going on
 
@@ -45,6 +68,14 @@ After running this script that database went from **39.37 GB to 3.15 GB**
 (36.23 GB reclaimed), `PRAGMA integrity_check` returned `ok`, and all 2,106
 sessions, 59,294 messages and 293,777 file parts were still there — verified by
 re-reading a session recorded before the prune and comparing it byte for byte.
+
+### The byte-identical duplicate problem
+
+One `wget --show-progress` command can generate **79,083 events** totalling
+**2.3 GB** — because the progress bar redraws in place and OpenCode snapshots
+the entire output on every redraw. From update ~1,000 to ~40,000, the content
+was byte-for-byte identical (31 KB repeated 39,000 times = 1.2 GB of pure
+waste). This tool now detects and reports these.
 
 ## Why deleting it is safe
 
@@ -80,18 +111,57 @@ sequence numbering continues normally, and keeps the newest sessions untouched.
 
 ## Usage
 
+### Quick diagnostics
+
 ```bash
-python3 opencode-db-prune.py                          # report only, changes nothing
-python3 opencode-db-prune.py --apply                  # prune, backing up first
-python3 opencode-db-prune.py --apply --no-backup      # skip the backup copy
-python3 opencode-db-prune.py --apply --keep 20        # leave 20 newest sessions alone
-python3 opencode-db-prune.py --db /path/to/opencode.db
+python3 opencode-db-prune.py --stats
 ```
 
-On Windows, the Python launcher works too:
+Instant overview: DB size, session/message/part counts, page stats, tool-output
+size. No heavy queries.
+
+### Report (default, changes nothing)
+
+```bash
+python3 opencode-db-prune.py
+```
+
+Full breakdown of the event table, deduplication analysis, and what would be
+pruned.
+
+### Prune
+
+```bash
+python3 opencode-db-prune.py --apply                    # prune with backup
+python3 opencode-db-prune.py --apply --batch 5000       # smaller batches
+python3 opencode-db-prune.py --apply --keep 20          # keep 20 sessions
+python3 opencode-db-prune.py --apply --no-backup        # skip backup
+```
+
+### Target a specific session
+
+```bash
+python3 opencode-db-prune.py --apply --session abc123-def456
+```
+
+### Clean tool-output
+
+```bash
+python3 opencode-db-prune.py --apply --tool-output              # delete all
+python3 opencode-db-prune.py --apply --tool-output --max-age 30 # older than 30 days
+```
+
+### Scheduled / daemon mode
+
+```bash
+python3 opencode-db-prune.py --schedule 6h              # every 6 hours
+python3 opencode-db-prune.py --schedule 1d --keep 10    # daily, keep 10 sessions
+```
+
+### Windows
 
 ```powershell
-py opencode-db-prune.py
+py opencode-db-prune.py --stats
 py opencode-db-prune.py --apply
 ```
 
@@ -105,11 +175,13 @@ No dependencies. Python 3.8+.
 - Refuses to run while the database file is held open by another process.
 - Refuses to run if message content is not readable outside `event`.
 - Refuses to run if the database was already corrupt.
-- Backs up first unless you pass `--no-backup` (the backup needs as much free
-  space as the database).
+- **Respects sync/workspace ownership** — won't touch synced aggregates unless
+  `--force-synced` is passed.
+- Backs up first unless you pass `--no-backup`.
+- **Incremental deletion in batches** — safe for databases of any size.
 - Runs `PRAGMA integrity_check` before and after.
-- Reports how many sessions, messages and parts survived, so you can see that
-  nothing was lost.
+- **Post-prune verification**: reads random sessions to confirm content survives.
+- Reports sessions, messages and parts that survived.
 - Enables `auto_vacuum = INCREMENTAL` so future growth stays reclaimable.
 
 ## Platforms
@@ -125,45 +197,51 @@ safeguard, but it still needs field confirmation on a real Windows installation:
 |---|---|---|
 | macOS | **tested** | `~/.local/share/opencode/opencode.db`, `~/Library/Application Support/opencode/opencode.db` |
 | Linux | written, untested | `$XDG_DATA_HOME/opencode/opencode.db`, `~/.local/share/opencode/opencode.db` |
-| Windows | implemented, needs field confirmation | `%USERPROFILE%\.local\share\opencode\opencode.db` (CLI), `%LOCALAPPDATA%\opencode\data\opencode.db` (desktop app) |
+| Windows | implemented, needs confirmation | `%USERPROFILE%\.local\share\opencode\opencode.db` (CLI), `%LOCALAPPDATA%\opencode\data\opencode.db` (desktop app) |
 
-If several databases exist, the largest is picked — that's the one with the
-problem. `OPENCODE_DB` is honoured and wins over everything else. You can also
-bypass detection entirely with `--db /path/to/opencode.db`.
+If several databases exist, the largest is picked. `OPENCODE_DB` is honoured
+and wins over everything else. You can also bypass detection with `--db`.
 
 ### Contributions for Linux and Windows are welcome
 
-If you hit the same problem on another platform and want to improve that part,
-the most useful things are:
+If you hit the same problem on another platform:
 
 - Confirm where OpenCode actually keeps the database on your system.
-- Check the "file in use" detection. On Windows it requests an exclusive handle
-  with `CreateFileW`; on Linux it shells out to `lsof`, which is not always
-  installed.
-- Say whether your numbers look like these, or whether the breakdown of the
-  `event` table is different on your setup.
-
-Opening an issue with the output of the report (the command without `--apply`,
-which changes nothing) is enough. Pull requests welcome.
+- Check the "file in use" detection.
+- Run `--stats` and share the output.
 
 ## How this differs from a VACUUM
 
 Other cleanup tools run `VACUUM`, which reclaims **free pages** — space that was
-freed inside the file but never returned to the filesystem. That is a real
-problem and those tools solve it.
+freed inside the file but never returned to the filesystem.
 
-It does not solve *this* one. Here the space is **live rows**. VACUUM alone
+It does not solve *this* problem. Here the space is **live rows**. VACUUM alone
 reclaims nothing until the rows are gone. This script deletes the redundant rows
 first and then runs VACUUM to shrink the file.
 
-If your database is bloated but the `event` table is small, you want a VACUUM
-tool, not this one. Run the report first and you'll see which case you're in.
+## How this differs from PR #36710
+
+PR [#36710](https://github.com/anomalyco/opencode/pull/36710) proposes
+integrated compaction inside OpenCode itself (TypeScript, part of the core).
+This tool is complementary:
+
+| | opencode-db-prune | PR #36710 |
+|---|---|---|
+| Language | Python (standalone) | TypeScript (integrated) |
+| Available now | Yes | Pending merge |
+| Batch size | Configurable | Fixed 10,000 |
+| Tool-output cleanup | Yes | No |
+| Schedule mode | Yes | No |
+| Dedup analysis | Yes | No |
+| Sync awareness | Yes | Yes |
+| Post-prune verification | Yes (random sampling) | Yes (projection check) |
 
 ## Related upstream issues
 
-- [#22110 — Session storage grows unboundedly](https://github.com/anomalyco/opencode/issues/22110)
-- [#31391 — why opencode.db so large?](https://github.com/anomalyco/opencode/issues/31391)
-- [#16777 — High memory usage and database bloat](https://github.com/anomalyco/opencode/issues/16777)
+- [#33356 — Unbounded event table growth](https://github.com/anomalyco/opencode/issues/33356)
+- [#38362 — OOM crash from event accumulation](https://github.com/anomalyco/opencode/issues/38362)
+- [#31391 — Why is opencode.db so large?](https://github.com/anomalyco/opencode/issues/31391)
+- [#29694 — Tool-output storage growth](https://github.com/anomalyco/opencode/issues/29694)
 
 The real fix belongs upstream: don't persist a full snapshot per streaming
 update, or prune the change feed when a session completes. Until then, this.
