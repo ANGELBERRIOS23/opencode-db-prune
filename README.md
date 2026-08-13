@@ -255,3 +255,12 @@ Hay una versión completa en español: **[LEEME.md](LEEME.md)**.
 ## License
 
 MIT
+
+## Want to reclaim even more?
+
+If you also want to free the space from your **conversations across every
+tool** (Claude Code, Codex, Antigravity, Command Code) by trimming everything
+before the last compaction — with a full backup first and an agent skill —
+check out **[conversation-reclaim](https://github.com/ANGELBERRIOS23/conversation-reclaim)**,
+which integrates this DB prune together with the other tools.
+

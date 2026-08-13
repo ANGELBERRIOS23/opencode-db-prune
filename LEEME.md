@@ -174,3 +174,12 @@ sesión termina. Mientras tanto, esto.
 ## Licencia
 
 MIT
+
+## ¿Quieres liberar más espacio?
+
+Si además quieres recuperar el espacio de tus **conversaciones de todas las
+herramientas** (Claude Code, Codex, Antigravity, Command Code) recortando lo
+anterior a la última compactación — con respaldo previo y skill para agentes —
+mira **[conversation-reclaim](https://github.com/ANGELBERRIOS23/conversation-reclaim)**,
+que integra esta poda de la DB junto con la de las demás herramientas.
+
