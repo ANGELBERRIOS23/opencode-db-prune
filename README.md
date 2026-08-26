@@ -109,6 +109,13 @@ This script is deliberately more conservative than what OpenCode does to
 itself: it deletes rows from `event` only, leaves `event_sequence` intact so
 sequence numbering continues normally, and keeps the newest sessions untouched.
 
+**4. Schema sanity check before touching anything.** The script validates that
+the database has the exact table structure it expects — correct columns, types,
+NOT NULL constraints, primary keys, and indexes. If OpenCode changes a single
+column, the diff is reported and the script refuses to run. This is intentionally
+brittle: an unknown schema means an unknown database, and we don't operate on
+unknowns. Use `--force` to override (at your own risk).
+
 ## Usage
 
 ### Quick diagnostics

@@ -46,6 +46,8 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from schema_validate import validate_schema, print_schema_report
+
 __version__ = "2.0.0"
 
 # Event types that are redundant copies of state stored in message/part tables.
@@ -639,6 +641,17 @@ def run_prune(args):
     # Connect
     cx = sqlite3.connect(db)
 
+    # Schema validation
+    print("  schema    : validating ...", end="", flush=True)
+    schema_ok, schema_errors, schema_warnings = validate_schema(cx, force=args.force)
+    print("\r", end="")  # clear the "validating ..." line
+    print_schema_report(schema_ok, schema_errors, schema_warnings)
+    if not schema_ok and not args.force:
+        print("\n  REFUSED: schema does not match expected structure.")
+        print("  Use --force to override (risky — know what you're doing).")
+        cx.close()
+        return 7
+
     # Pre-flight content check
     ok, detail = content_survives_outside_event(cx)
     print(f"  pre-flight: {detail}")
@@ -845,6 +858,8 @@ examples:
                     help="also prune synced/owned aggregates (risky)")
     ap.add_argument("--no-backup", action="store_true",
                     help="skip backup (it needs as much free space as the database)")
+    ap.add_argument("--force", action="store_true",
+                    help="bypass schema validation (risky — only if you know the DB is safe)")
     ap.add_argument("--schedule", metavar="INTERVAL",
                     help="run repeatedly at interval (e.g., 6h, 30m, 1d)")
     ap.add_argument("--db", metavar="PATH",

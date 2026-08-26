@@ -1,0 +1,86 @@
+{
+  "event": {
+    "columns": [
+      ["id", "TEXT", 0, 1],
+      ["aggregate_id", "TEXT", 1, 0],
+      ["seq", "INTEGER", 1, 0],
+      ["type", "TEXT", 1, 0],
+      ["data", "TEXT", 1, 0]
+    ],
+    "indexes": [
+      ["event_aggregate_seq_idx", true, ["aggregate_id", "seq"]],
+      ["event_aggregate_type_seq_idx", false, ["aggregate_id", "type", "seq"]]
+    ],
+    "extra_columns_allowed": []
+  },
+  "event_sequence": {
+    "columns": [
+      ["aggregate_id", "TEXT", 0, 1],
+      ["seq", "INTEGER", 1, 0]
+    ],
+    "indexes": [],
+    "extra_columns_allowed": ["owner_id"]
+  },
+  "session": {
+    "columns": [
+      ["id", "TEXT", 0, 1],
+      ["project_id", "TEXT", 1, 0],
+      ["parent_id", "TEXT", 0, 0],
+      ["slug", "TEXT", 1, 0],
+      ["directory", "TEXT", 1, 0],
+      ["title", "TEXT", 1, 0],
+      ["version", "TEXT", 1, 0],
+      ["share_url", "TEXT", 0, 0],
+      ["summary_additions", "INTEGER", 0, 0],
+      ["summary_deletions", "INTEGER", 0, 0],
+      ["summary_files", "INTEGER", 0, 0],
+      ["summary_diffs", "TEXT", 0, 0],
+      ["revert", "TEXT", 0, 0],
+      ["permission", "TEXT", 0, 0],
+      ["time_created", "INTEGER", 1, 0],
+      ["time_updated", "INTEGER", 1, 0],
+      ["time_compacting", "INTEGER", 0, 0],
+      ["time_archived", "INTEGER", 0, 0],
+      ["workspace_id", "TEXT", 0, 0],
+      ["path", "TEXT", 0, 0]
+    ],
+    "indexes": [
+      ["session_parent_idx", false, ["parent_id"]],
+      ["session_project_idx", false, ["project_id"]],
+      ["session_workspace_idx", false, ["workspace_id"]]
+    ],
+    "extra_columns_allowed": [
+      "agent", "model", "cost", "tokens_input", "tokens_output",
+      "tokens_reasoning", "tokens_cache_read", "tokens_cache_write",
+      "metadata"
+    ]
+  },
+  "message": {
+    "columns": [
+      ["id", "TEXT", 0, 1],
+      ["session_id", "TEXT", 1, 0],
+      ["time_created", "INTEGER", 1, 0],
+      ["time_updated", "INTEGER", 1, 0],
+      ["data", "TEXT", 1, 0]
+    ],
+    "indexes": [
+      ["message_session_time_created_id_idx", false, ["session_id", "time_created", "id"]]
+    ],
+    "extra_columns_allowed": []
+  },
+  "part": {
+    "columns": [
+      ["id", "TEXT", 0, 1],
+      ["message_id", "TEXT", 1, 0],
+      ["session_id", "TEXT", 1, 0],
+      ["time_created", "INTEGER", 1, 0],
+      ["time_updated", "INTEGER", 1, 0],
+      ["data", "TEXT", 1, 0]
+    ],
+    "indexes": [
+      ["part_message_id_id_idx", false, ["message_id", "id"]],
+      ["part_session_idx", false, ["session_id"]]
+    ],
+    "extra_columns_allowed": []
+  }
+}
