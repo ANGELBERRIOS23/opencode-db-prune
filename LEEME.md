@@ -23,6 +23,42 @@ would prune (all but the 5 newest sessions): 949,404 rows, 35.42 GB
 estimated size afterwards: ~3.96 GB
 ```
 
+## Novedad de la v3.0: OpenCode 1 y OpenCode 2
+
+OpenCode 2 cambió dónde guarda las conversaciones. El script detecta qué versión
+escribió tu base y actúa según el caso:
+
+| Caso | Qué ocupa el espacio | Qué hace el script |
+|---|---|---|
+| **OpenCode 1** | la tabla `event` (las copias de cada actualización) | la limpia, como en la v2.0 |
+| **OpenCode 2 que vino de la 1** | cada conversación dos veces: la tabla nueva `session_message` **y** las viejas `message`/`part` | `--drop-v1-copy` borra la copia vieja, sesión por sesión, después de comprobar que la nueva la tiene completa |
+| **OpenCode 2 instalado desde cero** | nada repetido | solo informa, no cambia nada |
+
+La primera vez que arranca, OpenCode 2 copia todas las sesiones de la 1 a
+`session_v2`/`session_message`, vacía él mismo la tabla `event` y anota
+`migration.v1-v2 = completed` en la tabla `kv`. Desde ese momento ya no vuelve a
+leer `message` ni `part`, pero tampoco las borra.
+
+Medido en una actualización real (120 sesiones):
+
+| | |
+|---|---|
+| Base después de pasar a OpenCode 2 | 269 MB |
+| Copia vieja comprobada como completa en las tablas nuevas | 114 sesiones, 107 MB |
+| Sesiones que se dejan igual porque tienen de 1 a 12 bloques de razonamiento solo en la copia vieja | 6 |
+| Después de `--apply --drop-v1-copy` | **143 MB** |
+
+Cada conversación se revisa pieza por pieza: cada texto, cada bloque de
+razonamiento y cada salida de herramienta de la copia vieja tiene que estar en la
+nueva. Si falta una sola pieza, la copia vieja de esa sesión se deja como está y
+aparece en el reporte. Una sesión de 261 mensajes, exportada con OpenCode 2 antes
+y después, salió idéntica byte por byte.
+
+`--drop-v1-copy` deja las filas de `session`, así que OpenCode 1 todavía muestra
+esas sesiones, pero sin sus mensajes. Úsalo cuando ya no vayas a regresar a
+OpenCode 1. Si OpenCode 2 no ha terminado de copiar las sesiones, no toca nada,
+porque la copia vieja todavía es su fuente.
+
 ## Qué está pasando en realidad
 
 OpenCode guarda **una copia completa del mensaje cada vez que lo actualiza**.
@@ -50,7 +86,7 @@ cuyos datos se anotaron antes de la limpieza y comparándolos uno a uno.
 ## Por qué es seguro borrarlo
 
 **1. El contenido vive en otro sitio.** El estado definitivo de cada mensaje está
-en las tablas `message` y `part`. El script lo verifica antes de tocar nada: abre
+en las tablas `message` y `part` (en OpenCode 2, `session_message`). El script lo verifica antes de tocar nada: abre
 la sesión más antigua de tu base y comprueba que su texto siga siendo legible
 fuera de `event`. Si no lo estuviera, se niega a ejecutarse.
 
@@ -87,6 +123,7 @@ python3 opencode-db-prune.py --apply                  # limpia, respaldando ante
 python3 opencode-db-prune.py --apply --no-backup      # sin copia de respaldo
 python3 opencode-db-prune.py --apply --keep 20        # deja intactas las 20 más recientes
 python3 opencode-db-prune.py --db /ruta/a/opencode.db
+python3 opencode-db-prune.py --apply --drop-v1-copy   # OpenCode 2: borra la copia vieja comprobada
 ```
 
 En Windows también puedes usar el lanzador de Python:
@@ -97,7 +134,9 @@ py opencode-db-prune.py --apply
 ```
 
 **Cierra OpenCode antes.** El script comprueba si el archivo está abierto y se
-niega a ejecutarse si lo está.
+niega a ejecutarse si lo está. OpenCode 2 deja un servicio corriendo aunque lo
+cierres: detenlo con `opencode service stop` y cierra también la app de
+escritorio.
 
 Sin dependencias. Python 3.8 o superior.
 
@@ -105,6 +144,9 @@ Sin dependencias. Python 3.8 o superior.
 
 - Se niega a ejecutarse si otro proceso tiene el archivo abierto.
 - Se niega si el contenido de los mensajes no es legible fuera de `event`.
+- `--drop-v1-copy` solo toca sesiones cuyo texto, razonamiento y salidas de
+  herramientas ya están completos en las tablas de OpenCode 2, y solo después de
+  que OpenCode 2 marcó su copia como terminada.
 - Se niega si la base ya venía dañada.
 - Respalda antes, salvo que pases `--no-backup` (la copia necesita tanto espacio
   libre como ocupa la base).

@@ -8,8 +8,10 @@ description: >-
   snapshots). Úsala cuando el usuario diga "el opencode.db está enorme",
   "opencode me ocupa demasiado", "liberar espacio de opencode", "podar la base
   de opencode", "reducir el tamaño de mi opencode.db" o quiera diagnosticar el
-  tamaño de la base (--stats). No borra sesiones ni mensajes: solo snapshots
-  redundantes que ya viven en las tablas message/part.
+  tamaño de la base (--stats). Funciona con OpenCode 1 y OpenCode 2: en la 2,
+  además, puede borrar la copia vieja de las conversaciones que quedó tras la
+  actualización (--drop-v1-copy). No borra sesiones ni mensajes: solo datos
+  repetidos que ya viven en otra tabla.
 ---
 
 # opencode-db-prune
@@ -25,6 +27,20 @@ escribe un snapshot completo del mensaje en la tabla `event`
 respuesta genera decenas de snapshots intermedios y cada uno lleva el texto
 acumulado completo. Resultado: bases donde el 90%+ es pura duplicación
 (verificado: 147k filas / 4.4 GB en una base de 4.9 GB).
+
+**OpenCode 2 es distinto.** Al arrancar por primera vez copia todas las
+conversaciones a `session_v2`/`session_message`, vacía él mismo `event` y anota
+`migration.v1-v2 = completed` en la tabla `kv`. Pero deja la copia vieja en
+`message`/`part`: después de actualizar, cada conversación está dos veces
+(medido: 107 MB de 269 MB). El script detecta el caso y lo dice en la línea
+`layout`:
+
+| `layout` | Qué hacer |
+|---|---|
+| `OpenCode 1` | limpiar `event` con `--apply` |
+| `OpenCode 2 (OpenCode 1 copy still present)` | `--apply --drop-v1-copy` |
+| `OpenCode 2 (import of OpenCode 1 sessions not finished)` | abrir OpenCode 2 una vez y repetir; no se toca nada |
+| `OpenCode 2` | nada que limpiar en la base; si acaso `--tool-output` |
 
 ## Dónde está
 
@@ -44,6 +60,7 @@ python3 opencode-db-prune.py --apply --session <id>   # solo una sesión
 python3 opencode-db-prune.py --apply --tool-output --max-age 30  # + tool-output viejo
 python3 opencode-db-prune.py --apply --batch 5000   # lotes grandes sin bloquear
 python3 opencode-db-prune.py --schedule 6h      # programado cada 6 h
+python3 opencode-db-prune.py --apply --drop-v1-copy  # OpenCode 2: borra la copia vieja comprobada
 ```
 
 1. **Primero `--stats` o el reporte plano**: mostrar al usuario cuántos eventos
@@ -53,13 +70,21 @@ python3 opencode-db-prune.py --schedule 6h      # programado cada 6 h
    tocar* — el script copia `opencode.db` a `opencode.db.bak-<fecha>` por
    defecto.
 3. **`--apply`**: hace pre-flight (verifica que el contenido viva en
-   `message`/`part`, no solo en `event`), borra en lotes, VACUUM, verifica
-   integridad y muestra el resultado.
+   `message`/`part`, o en `session_message` con OpenCode 2, no solo en
+   `event`), borra en lotes, VACUUM, verifica integridad y muestra el
+   resultado.
+4. **`--drop-v1-copy`** (solo OpenCode 2): antes de borrar la copia vieja de una
+   sesión comprueba que cada texto, razonamiento y salida de herramienta esté en
+   `session_message`. Las sesiones con alguna pieza que solo existe en la copia
+   vieja se dejan igual y salen listadas en el reporte. Avisar al usuario de que,
+   si vuelve a OpenCode 1, esas sesiones aparecerán sin mensajes.
 
 ## Seguridad
 
 - **Refusa si opencode está corriendo** (la DB está abierta) — avisar al
-  usuario que cierre opencode y reintente.
+  usuario que cierre opencode y reintente. En OpenCode 2 eso incluye detener
+  el servicio de fondo (`opencode service stop`) y cerrar la app de escritorio;
+  si no, la base sigue abierta aunque no se vea ninguna ventana.
 - Pre-flight: si el contenido solo existe en la tabla `event`, se niega a
   tocar nada.
 - Respaldo automático `opencode.db.bak-<fecha>` salvo `--no-backup`.
@@ -78,6 +103,17 @@ sqlite3 opencode.db "DELETE FROM event WHERE type IN ('message.updated.1','messa
 # verificación
 sqlite3 opencode.db "PRAGMA integrity_check"   # → ok
 ```
+
+En OpenCode 2 la tabla `event` ya viene vacía; lo que pesa es la copia vieja.
+Para verla:
+
+```bash
+sqlite3 opencode.db "SELECT value FROM kv WHERE key='migration.v1-v2'"   # → {"phase":"completed"}
+sqlite3 opencode.db "SELECT count(*), sum(length(data)) FROM part"        # tamaño de la copia vieja
+```
+
+No la borres a mano con un `DELETE FROM part`: el script comprueba sesión por
+sesión que la copia nueva esté completa, y a mano eso no se hace.
 
 El respaldo `.bak-<fecha>` se restaura copiándolo sobre `opencode.db` con
 opencode cerrado.

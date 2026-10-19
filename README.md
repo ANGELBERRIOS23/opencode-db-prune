@@ -12,11 +12,12 @@ without deleting a single session, message or file part.
 
 ```
 ============================================================
- opencode-db-prune v2.0.0
+ opencode-db-prune v3.0.0
 ============================================================
 
   database : /home/you/.local/share/opencode/opencode.db
   size     : 39.37 GB
+  layout   : OpenCode 1
 
   ────────────────────────────────────────────────────────
   Event table: 953,214 rows, 35.42 GB
@@ -30,6 +31,42 @@ without deleting a single session, message or file part.
   Would prune: 949,404 rows, 35.42 GB
   Estimated size after: ~3.96 GB
 ```
+
+## What's new in v3.0: OpenCode 1 and OpenCode 2
+
+OpenCode 2 changed where conversations live. The script detects which version
+wrote your database and adapts:
+
+| Layout | What takes the space | What the script does |
+|---|---|---|
+| **OpenCode 1** | the `event` log (snapshots) | prunes it, as in v2.0 |
+| **OpenCode 2, upgraded from 1** | every conversation twice: the new `session_message` table **and** the old `message`/`part` tables | `--drop-v1-copy` removes the old copy, session by session, after checking that the new tables have all of it |
+| **OpenCode 2, fresh install** | nothing redundant | reports and changes nothing |
+
+On its first start, OpenCode 2 imports every OpenCode 1 session into
+`session_v2`/`session_message`, empties the `event` log itself and records
+`migration.v1-v2 = completed` in the `kv` table. From then on it never reads
+`message` or `part` again, but it doesn't delete them either.
+
+Measured on a real upgrade (120 sessions):
+
+| | |
+|---|---|
+| Database after upgrading to OpenCode 2 | 269 MB |
+| Old copy verified complete in the new tables | 114 sessions, 107 MB |
+| Sessions kept because 1-12 reasoning blocks exist only in the old copy | 6 |
+| After `--apply --drop-v1-copy` | **143 MB** |
+
+Each conversation is checked piece by piece: every text, every reasoning block
+and every tool output of the old copy has to appear in the new one. If one
+piece is missing, that session's old copy is left alone and listed in the
+report. A 261-message session exported by OpenCode 2 before and after the drop
+was identical byte for byte.
+
+`--drop-v1-copy` keeps the `session` rows, so an OpenCode 1 client still lists
+the sessions, but without their messages. Use it once you no longer go back to
+OpenCode 1. It refuses to touch anything while OpenCode 2 has not finished its
+import, because the old copy is still its source.
 
 ## What's new in v2.0
 
@@ -80,7 +117,7 @@ waste). This tool now detects and reports these.
 ## Why deleting it is safe
 
 **1. The content lives somewhere else.** The final state of every message is in
-the `message` and `part` tables. The script verifies this before touching
+the `message` and `part` tables (`session_message` in OpenCode 2). The script verifies this before touching
 anything: it opens the oldest session in your database and checks its text is
 still readable outside `event`. If it isn't, it refuses to run.
 
@@ -144,6 +181,13 @@ python3 opencode-db-prune.py --apply --no-backup        # skip backup
 python3 opencode-db-prune.py --apply --session abc123-def456
 ```
 
+### OpenCode 2: drop the OpenCode 1 copy
+
+```bash
+python3 opencode-db-prune.py                           # the report lists what is safe to drop
+python3 opencode-db-prune.py --apply --drop-v1-copy    # drop it, with backup
+```
+
 ### Clean tool-output
 
 ```bash
@@ -166,7 +210,8 @@ py opencode-db-prune.py --apply
 ```
 
 **Quit OpenCode first.** The script checks whether the file is open and refuses
-to run if it is.
+to run if it is. OpenCode 2 keeps a background service running after you close
+it; stop it with `opencode service stop` and close the desktop app too.
 
 No dependencies. Python 3.8+.
 
@@ -174,6 +219,9 @@ No dependencies. Python 3.8+.
 
 - Refuses to run while the database file is held open by another process.
 - Refuses to run if message content is not readable outside `event`.
+- `--drop-v1-copy` only touches sessions whose every text, reasoning block and
+  tool output is already in the OpenCode 2 tables, and only after OpenCode 2
+  marked its import as completed.
 - Refuses to run if the database was already corrupt.
 - **Respects sync/workspace ownership** — won't touch synced aggregates unless
   `--force-synced` is passed.

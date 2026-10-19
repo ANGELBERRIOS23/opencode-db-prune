@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
-"""opencode-db-prune — Reclaim storage from OpenCode's redundant event log.
+"""opencode-db-prune — Reclaim storage from OpenCode's redundant data.
 
-OpenCode stores a full copy of every message on each streaming update. A single
-reply may generate dozens of intermediate snapshots, each carrying the full
-accumulated text. The result: databases that are 90%+ redundant data.
+OpenCode 1 stores a full copy of every message on each streaming update. A
+single reply may generate dozens of intermediate snapshots, each carrying the
+full accumulated text. The result: databases that are 90%+ redundant data.
 
-This tool safely removes those redundant snapshots without deleting any session,
-message, or file part.
+OpenCode 2 clears that event log itself, but its first start copies every
+conversation into new tables (session_v2 / session_message) and leaves the
+OpenCode 1 copy (message / part) behind. After the upgrade the database holds
+every conversation twice.
+
+This tool works with both layouts. It removes the redundant event snapshots
+without deleting any session, message, or file part, and with --drop-v1-copy it
+removes the leftover OpenCode 1 copy of each conversation that is verified to
+be complete in the OpenCode 2 tables.
 
 Features:
+  - Detects the layout: OpenCode 1, OpenCode 2, or OpenCode 2 with the
+    OpenCode 1 copy still present
+  - --drop-v1-copy: removes the OpenCode 1 copy session by session, only after
+    checking that every text, reasoning block and tool output is in OpenCode 2
   - Incremental compaction in configurable batches (safe for 50+ GB databases)
   - Smart deduplication: detects byte-identical consecutive snapshots
   - Per-session targeting (--session <id>)
@@ -28,6 +39,7 @@ Usage:
     python3 opencode-db-prune.py --apply --tool-output
     python3 opencode-db-prune.py --apply --tool-output --max-age 30
     python3 opencode-db-prune.py --schedule 6h        # run every 6 hours
+    python3 opencode-db-prune.py --apply --drop-v1-copy   # OpenCode 2 only
 
 Requires only the Python standard library. Python 3.8+.
 """
@@ -46,7 +58,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 
 # Event types that are redundant copies of state stored in message/part tables.
 REDUNDANT = ("message.updated.1", "message.part.updated.1", "session.updated.1")
@@ -57,6 +69,19 @@ DEFAULT_BATCH = 10000
 # Tables that indicate sync/workspace ownership — aggregates in these should
 # not be compacted without explicit override.
 SYNC_TABLES = ("workspace",)
+
+# OpenCode 2 records its one-time import of OpenCode 1 sessions under this key
+# in the `kv` table. Once the phase is "completed" it never reads the
+# OpenCode 1 tables again.
+V1_MIGRATION_KEY = "migration.v1-v2"
+
+# OpenCode 1 part types whose content must exist in OpenCode 2 before the
+# OpenCode 1 copy of a session can be dropped.
+V1_CONTENT_QUERY = (
+    "select json_extract(data,'$.type'), "
+    "coalesce(json_extract(data,'$.text'), json_extract(data,'$.state.output')) "
+    "from part where message_id in (select id from message where session_id=?) "
+    "and json_extract(data,'$.type') in ('text','reasoning','tool')")
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +118,23 @@ def timestamp_now():
 # Database location
 # ---------------------------------------------------------------------------
 
+def opencode_reported_db():
+    """Ask the installed opencode where its database is, if it can tell.
+
+    OpenCode 2 answers `opencode debug paths db` without starting its server;
+    OpenCode 1 answers `opencode db path`. Returns None when neither works.
+    """
+    for cmd in (["opencode", "debug", "paths", "db"], ["opencode", "db", "path"]):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+        path = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+        if result.returncode == 0 and path.endswith(".db"):
+            return path
+    return None
+
+
 def find_database():
     """Locate OpenCode's database on macOS, Linux or Windows.
 
@@ -104,6 +146,9 @@ def find_database():
         return override
 
     candidates = []
+    reported = opencode_reported_db()
+    if reported:
+        candidates.append(reported)
     xdg = os.environ.get("XDG_DATA_HOME")
     if xdg:
         candidates.append(os.path.join(xdg, "opencode", "opencode.db"))
@@ -187,12 +232,82 @@ def database_in_use(path):
         return None
 
 
-def content_survives_outside_event(cx):
-    """Verify the final message content lives in `part`, not only in `event`.
+def detect_layout(cx):
+    """Work out which OpenCode wrote this database.
+
+    OpenCode 1 already created an empty `session_message` table, so the
+    OpenCode 2 marker is `session_v2` plus the migration key in `kv`.
+    Returns a dict with the flags the rest of the tool needs.
+    """
+    tables = {r[0] for r in cx.execute(
+        "select name from sqlite_master where type='table'")}
+    layout = {
+        "v1_tables": {"session", "message", "part"} <= tables,
+        "v2_tables": {"session_v2", "session_message"} <= tables,
+        "has_event": "event" in tables,
+        "migration": None,
+    }
+    if "kv" in tables:
+        row = cx.execute("select value from kv where key=?",
+                         (V1_MIGRATION_KEY,)).fetchone()
+        if row:
+            try:
+                layout["migration"] = json.loads(row[0]).get("phase")
+            except (ValueError, AttributeError):
+                layout["migration"] = "unreadable"
+    layout["v2"] = layout["v2_tables"]
+    layout["v1_rows"] = (cx.execute("select count(*) from message").fetchone()[0]
+                         if layout["v1_tables"] else 0)
+    return layout
+
+
+def layout_name(layout):
+    """Human description of the detected layout."""
+    if not layout["v2"]:
+        return "OpenCode 1"
+    if layout["migration"] == "completed" and layout["v1_rows"]:
+        return "OpenCode 2 (OpenCode 1 copy still present)"
+    if layout["migration"] == "completed":
+        return "OpenCode 2"
+    if layout["v1_rows"]:
+        return "OpenCode 2 (import of OpenCode 1 sessions not finished)"
+    return "OpenCode 2"
+
+
+def v2_session_has_text(cx, session):
+    """Does an OpenCode 2 session have at least one readable text?"""
+    row = cx.execute(
+        "select 1 from session_message m, json_each(m.data, '$.content') j "
+        "where m.session_id=? and m.type='assistant' "
+        "and json_extract(j.value,'$.type')='text' "
+        "and length(json_extract(j.value,'$.text')) > 0 limit 1",
+        (session,)).fetchone()
+    if row:
+        return True
+    row = cx.execute(
+        "select 1 from session_message where session_id=? and type='user' "
+        "and length(json_extract(data,'$.text')) > 0 limit 1",
+        (session,)).fetchone()
+    return bool(row)
+
+
+def content_survives_outside_event(cx, layout):
+    """Verify the final message content lives outside `event`.
 
     This is the authorization check. If content is only in `event`, the tool
-    refuses to run.
+    refuses to run. OpenCode 1 keeps it in `part`; OpenCode 2 in
+    `session_message`.
     """
+    if layout["v2"]:
+        row = cx.execute(
+            "select v.id from session_v2 v where exists "
+            "(select 1 from session_message m where m.session_id=v.id) "
+            "order by v.time_created asc limit 1").fetchone()
+        if not row:
+            return True, "database has no OpenCode 2 sessions"
+        ok = v2_session_has_text(cx, row[0])
+        return ok, f"oldest session: text {'present' if ok else 'MISSING'} in session_message"
+
     row = cx.execute(
         "select id from session order by time_created asc limit 1").fetchone()
     if not row:
@@ -228,14 +343,17 @@ def get_synced_aggregates(cx):
             synced.update(r[0] for r in rows)
         except sqlite3.OperationalError:
             pass  # table doesn't exist in this version
-    # Also check event_sequence for aggregates with active consumers
-    try:
-        rows = cx.execute(
-            "select distinct aggregate_id from event_sequence "
-            "where consumer_id is not null and consumer_id != ''").fetchall()
-        synced.update(r[0] for r in rows)
-    except sqlite3.OperationalError:
-        pass
+    # Also check event_sequence for aggregates with active consumers. The column
+    # was `consumer_id` in early builds; current ones call it `owner_id`.
+    for column in ("consumer_id", "owner_id"):
+        try:
+            rows = cx.execute(
+                f"select distinct aggregate_id from event_sequence "
+                f"where {column} is not null and {column} != ''").fetchall()
+            synced.update(r[0] for r in rows)
+            break
+        except sqlite3.OperationalError:
+            continue
     return synced
 
 
@@ -261,21 +379,30 @@ def quick_stats(db_path):
     size = os.path.getsize(db_path)
     cx = sqlite3.connect(db_path)
     cx.execute("pragma query_only = ON")
+    layout = detect_layout(cx)
 
-    sessions = cx.execute("select count(*) from session").fetchone()[0]
-    messages = cx.execute("select count(*) from message").fetchone()[0]
-    parts = cx.execute("select count(*) from part").fetchone()[0]
+    sessions = messages = parts = 0
+    if layout["v1_tables"]:
+        sessions = cx.execute("select count(*) from session").fetchone()[0]
+        messages = cx.execute("select count(*) from message").fetchone()[0]
+        parts = cx.execute("select count(*) from part").fetchone()[0]
+    v2_sessions = v2_messages = 0
+    if layout["v2"]:
+        v2_sessions = cx.execute("select count(*) from session_v2").fetchone()[0]
+        v2_messages = cx.execute("select count(*) from session_message").fetchone()[0]
 
     # Approximate event count using sqlite_stat1 if available, else count
-    try:
-        event_rows = cx.execute(
-            "select stat from sqlite_stat1 where tbl='event' limit 1").fetchone()
-        if event_rows:
-            event_count = int(event_rows[0].split()[0])
-        else:
+    event_count = 0
+    if layout["has_event"]:
+        try:
+            event_rows = cx.execute(
+                "select stat from sqlite_stat1 where tbl='event' limit 1").fetchone()
+            if event_rows:
+                event_count = int(event_rows[0].split()[0])
+            else:
+                event_count = cx.execute("select count(*) from event").fetchone()[0]
+        except sqlite3.OperationalError:
             event_count = cx.execute("select count(*) from event").fetchone()[0]
-    except sqlite3.OperationalError:
-        event_count = cx.execute("select count(*) from event").fetchone()[0]
 
     # Page-based size estimate for event table
     page_size = cx.execute("pragma page_size").fetchone()[0]
@@ -304,13 +431,20 @@ def quick_stats(db_path):
     print(f" opencode-db-prune v{__version__} — Quick Stats")
     print(f"{'='*60}")
     print(f"\n  database    : {db_path}")
+    print(f"  layout      : {layout_name(layout)}")
     print(f"  platform    : {sys.platform}")
     print(f"  db size     : {human(size)}")
     print(f"  wal size    : {human(wal_size)}")
     print(f"  total disk  : {human(size + wal_size)}")
-    print(f"\n  sessions    : {sessions:,}")
-    print(f"  messages    : {messages:,}")
-    print(f"  parts       : {parts:,}")
+    if layout["v2"]:
+        print(f"\n  OpenCode 2  : {v2_sessions:,} sessions, {v2_messages:,} messages")
+        if messages:
+            print(f"  OpenCode 1 copy: {sessions:,} sessions, {messages:,} messages, "
+                  f"{parts:,} parts (see --drop-v1-copy)")
+    else:
+        print(f"\n  sessions    : {sessions:,}")
+        print(f"  messages    : {messages:,}")
+        print(f"  parts       : {parts:,}")
     print(f"  events      : {event_count:,}")
     print(f"\n  page_size   : {page_size}")
     print(f"  page_count  : {page_count:,}")
@@ -321,7 +455,8 @@ def quick_stats(db_path):
         print(f"\n  tool-output : {tool_dir}")
         print(f"  tool files  : {tool_files:,}")
         print(f"  tool size   : {human(tool_size)}")
-    print(f"\n  estimated event overhead: ~{human(max(0, size - (size * 0.1)))}")
+    if event_count:
+        print(f"\n  estimated event overhead: ~{human(max(0, size - (size * 0.1)))}")
     print(f"\n  Run without --stats for full breakdown.")
     print(f"{'='*60}\n")
 
@@ -502,14 +637,109 @@ def prune_events_batched(cx, keep_sessions, synced_ids, batch_size=DEFAULT_BATCH
 
 
 # ---------------------------------------------------------------------------
+# OpenCode 1 copy left behind by the OpenCode 2 import
+# ---------------------------------------------------------------------------
+
+def _collect_strings(obj, out):
+    if isinstance(obj, str):
+        out.append(obj)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            _collect_strings(value, out)
+    elif isinstance(obj, list):
+        for value in obj:
+            _collect_strings(value, out)
+
+
+def v1_copy_is_redundant(cx, session):
+    """Is every piece of the OpenCode 1 copy of `session` also in OpenCode 2?
+
+    Checks each text, reasoning block and tool output of the OpenCode 1 parts
+    against the strings stored in the OpenCode 2 messages of the same session.
+    Returns (ok, missing_count).
+    """
+    if not cx.execute("select 1 from session_v2 where id=?", (session,)).fetchone():
+        return False, -1
+    strings = []
+    for (data,) in cx.execute(
+            "select data from session_message where session_id=?", (session,)):
+        try:
+            _collect_strings(json.loads(data), strings)
+        except ValueError:
+            continue
+    if not strings:
+        return False, -1
+    corpus = "\x00".join(strings)
+    missing = 0
+    for _ptype, content in cx.execute(V1_CONTENT_QUERY, (session,)):
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if content.strip() not in corpus:
+            missing += 1
+    return missing == 0, missing
+
+
+def plan_v1_copy(cx, excluded, session_filter=None):
+    """Split the OpenCode 1 copy into droppable and kept sessions.
+
+    Returns (droppable_ids, kept, droppable_bytes) where kept is a list of
+    (session_id, reason).
+    """
+    sessions = [r[0] for r in cx.execute(
+        "select distinct session_id from message"
+        + (" where session_id=?" if session_filter else ""),
+        (session_filter,) if session_filter else ())]
+    droppable, kept, size = [], [], 0
+    for session in sessions:
+        if session in excluded:
+            kept.append((session, "recent session (--keep)"))
+            continue
+        ok, missing = v1_copy_is_redundant(cx, session)
+        if not ok:
+            reason = ("not imported into OpenCode 2" if missing < 0
+                      else f"{missing} piece(s) only in the OpenCode 1 copy")
+            kept.append((session, reason))
+            continue
+        droppable.append(session)
+        size += cx.execute(
+            "select coalesce(sum(length(data)),0) from message where session_id=?",
+            (session,)).fetchone()[0]
+        size += cx.execute(
+            "select coalesce(sum(length(data)),0) from part where message_id in "
+            "(select id from message where session_id=?)", (session,)).fetchone()[0]
+    return droppable, kept, size
+
+
+def drop_v1_copy(cx, sessions):
+    """Delete the OpenCode 1 messages and parts of the given sessions.
+
+    The `session` rows stay, so an OpenCode 1 client still lists them.
+    Returns the number of sessions whose copy was dropped.
+    """
+    for i, session in enumerate(sessions, 1):
+        cx.execute("delete from part where message_id in "
+                   "(select id from message where session_id=?)", (session,))
+        cx.execute("delete from message where session_id=?", (session,))
+        cx.commit()
+        sys.stdout.write(f"\r  OpenCode 1 copy: {i}/{len(sessions)} sessions")
+        sys.stdout.flush()
+    if sessions:
+        sys.stdout.write("\n")
+    return len(sessions)
+
+
+# ---------------------------------------------------------------------------
 # Post-prune verification
 # ---------------------------------------------------------------------------
 
-def verify_sessions(cx, sample_size=5):
+def verify_sessions(cx, layout, sample_size=5):
     """Verify random sessions still have readable content after pruning.
 
     Returns (passed, failed, details).
     """
+    if layout["v2"]:
+        return verify_v2_sessions(cx, sample_size)
+
     all_sessions = cx.execute(
         "select id from session order by time_created desc").fetchall()
     if not all_sessions:
@@ -549,6 +779,33 @@ def verify_sessions(cx, sample_size=5):
                 f"  {session_id[:8]}... {msg_count} msgs, {part_count} parts, "
                 f"text={'yes' if text else 'NO'}: FAILED")
 
+    return passed, failed, "\n".join(details)
+
+
+def verify_v2_sessions(cx, sample_size=5):
+    """OpenCode 2 version of verify_sessions: content lives in session_message."""
+    all_sessions = cx.execute(
+        "select id from session_v2 order by time_created desc").fetchall()
+    if not all_sessions:
+        return 0, 0, "no sessions to verify"
+
+    sample = random.sample(all_sessions, min(sample_size, len(all_sessions)))
+    passed = 0
+    failed = 0
+    details = []
+    for (session_id,) in sample:
+        msg_count = cx.execute(
+            "select count(*) from session_message where session_id=? "
+            "and type in ('user','assistant')", (session_id,)).fetchone()[0]
+        if msg_count == 0:
+            passed += 1
+            details.append(f"  {session_id[:12]}... empty session: OK")
+        elif v2_session_has_text(cx, session_id):
+            passed += 1
+            details.append(f"  {session_id[:12]}... {msg_count} msgs: OK")
+        else:
+            failed += 1
+            details.append(f"  {session_id[:12]}... {msg_count} msgs, text=NO: FAILED")
     return passed, failed, "\n".join(details)
 
 
@@ -631,16 +888,20 @@ def run_prune(args):
     status_str = 'yes' if in_use else ('no' if in_use is False else 'unknown')
     print(f"  in use   : {status_str}")
     if args.apply and in_use:
-        print("\n  REFUSED: database is open. Quit OpenCode first.")
+        print("\n  REFUSED: database is open. Quit OpenCode first. OpenCode 2 also\n"
+              "  keeps a background service running: stop it with\n"
+              "  `opencode service stop` and close the desktop app.")
         return 2
     if args.apply and in_use is None:
         print("  WARNING: could not verify file lock. Make sure OpenCode is closed.")
 
     # Connect
     cx = sqlite3.connect(db)
+    layout = detect_layout(cx)
+    print(f"  layout   : {layout_name(layout)}")
 
     # Pre-flight content check
-    ok, detail = content_survives_outside_event(cx)
+    ok, detail = content_survives_outside_event(cx, layout)
     print(f"  pre-flight: {detail}")
     if not ok:
         print("\n  REFUSED: message content not readable outside event table.")
@@ -653,17 +914,20 @@ def run_prune(args):
         print(f"  synced aggregates: {len(synced)} (will be skipped)")
 
     # Measure
-    per_type, (total_rows, total_bytes) = measure(cx)
-
-    # Deduplication analysis
-    dup_count, dup_bytes = count_duplicates(cx, args.session)
+    if layout["has_event"]:
+        per_type, (total_rows, total_bytes) = measure(cx)
+        dup_count, dup_bytes = count_duplicates(cx, args.session)
+    else:
+        per_type, total_rows, total_bytes = {}, 0, 0
+        dup_count, dup_bytes = 0, 0
     dedup_pct = (dup_count / total_rows * 100) if total_rows > 0 else 0
 
-    # Determine what to prune
+    # Determine what to prune. Session ids are the same in both layouts.
+    session_table = "session_v2" if layout["v2"] else "session"
     keep_ids = []
     if not args.session:
         keep_ids = [r[0] for r in cx.execute(
-            "select id from session order by time_created desc limit ?",
+            f"select id from {session_table} order by time_created desc limit ?",
             (args.keep,))]
 
     excluded = set(keep_ids)
@@ -678,12 +942,14 @@ def run_prune(args):
         session_clause = " and aggregate_id = ?"
         session_params = [args.session]
 
-    doomed_rows, doomed_bytes = cx.execute(
-        f"select count(*), coalesce(sum(length(data)),0) from event "
-        f"where type in ({','.join('?' * len(REDUNDANT))}) "
-        f"and aggregate_id not in ({placeholders})"
-        f"{session_clause}",
-        (*REDUNDANT, *excluded_list, *session_params)).fetchone()
+    doomed_rows, doomed_bytes = 0, 0
+    if layout["has_event"]:
+        doomed_rows, doomed_bytes = cx.execute(
+            f"select count(*), coalesce(sum(length(data)),0) from event "
+            f"where type in ({','.join('?' * len(REDUNDANT))}) "
+            f"and aggregate_id not in ({placeholders})"
+            f"{session_clause}",
+            (*REDUNDANT, *excluded_list, *session_params)).fetchone()
 
     # Report
     print(f"\n  {'─'*56}")
@@ -693,6 +959,9 @@ def run_prune(args):
         pct = (b / total_bytes * 100) if total_bytes > 0 else 0
         print(f"    {t:30} {n:>9,}  {human(b):>10}  ({pct:.1f}%)")
     print(f"  {'─'*56}")
+    if layout["v2"] and total_rows == 0:
+        print("  OpenCode 2 does not fill this log, and empties it when it imports\n"
+              "  OpenCode 1. Nothing to prune here.")
     if dup_count > 0:
         print(f"  Byte-identical duplicates: {dup_count:,} rows, "
               f"{human(dup_bytes)} ({dedup_pct:.1f}% of events)")
@@ -703,7 +972,37 @@ def run_prune(args):
         print(f"  Keeping {args.keep} newest sessions untouched")
     if synced and not args.force_synced:
         print(f"  Skipping {len(synced)} synced/owned aggregates")
-    print(f"  Estimated size after: ~{human(max(0, size_before - doomed_bytes))}")
+
+    # OpenCode 1 copy left behind by the OpenCode 2 import
+    v1_drop, v1_kept, v1_bytes = [], [], 0
+    if layout["v2"] and layout["v1_rows"]:
+        print(f"\n  {'─'*56}")
+        print(f"  OpenCode 1 copy: {layout['v1_rows']:,} messages")
+        print(f"  {'─'*56}")
+        if layout["migration"] != "completed":
+            print("  OpenCode 2 has not finished importing these sessions; the copy\n"
+                  "  is still its source. Open OpenCode 2 once and run this again.")
+        else:
+            v1_drop, v1_kept, v1_bytes = plan_v1_copy(
+                cx, set(keep_ids), args.session)
+            print(f"  Verified complete in OpenCode 2: {len(v1_drop):,} sessions, "
+                  f"{human(v1_bytes)}")
+            if v1_kept:
+                print(f"  Kept as they are: {len(v1_kept):,} sessions")
+                for session, reason in v1_kept[:10]:
+                    print(f"    {session}  {reason}")
+                if len(v1_kept) > 10:
+                    print(f"    ... and {len(v1_kept) - 10} more")
+            if not args.drop_v1_copy:
+                print("  Use --drop-v1-copy to remove the verified copies. OpenCode 1\n"
+                      "  will then list those sessions without their messages.")
+    elif args.drop_v1_copy:
+        print("\n  --drop-v1-copy: nothing to do, this database has no OpenCode 1 copy\n"
+              "  next to OpenCode 2 tables.")
+    if not args.drop_v1_copy:
+        v1_drop, v1_bytes = [], 0
+
+    print(f"\n  Estimated size after: ~{human(max(0, size_before - doomed_bytes - v1_bytes))}")
 
     # Tool-output report
     tool_dir = find_tool_output_dir(db)
@@ -721,7 +1020,7 @@ def run_prune(args):
               f"(use --tool-output to clean)")
 
     # Total savings
-    total_savings = doomed_bytes + tool_prunable_size
+    total_savings = doomed_bytes + v1_bytes + tool_prunable_size
     print(f"\n  Total potential savings: {human(total_savings)}")
 
     if not args.apply:
@@ -755,10 +1054,16 @@ def run_prune(args):
         return 5
 
     # Incremental deletion in batches
-    print(f"\n  Deleting events (batch size: {args.batch:,})...")
-    deleted, freed = prune_events_batched(
-        cx, keep_ids, synced, batch_size=args.batch,
-        session_filter=args.session, force_synced=args.force_synced)
+    if layout["has_event"]:
+        print(f"\n  Deleting events (batch size: {args.batch:,})...")
+        prune_events_batched(
+            cx, keep_ids, synced, batch_size=args.batch,
+            session_filter=args.session, force_synced=args.force_synced)
+
+    # OpenCode 1 copy
+    if v1_drop:
+        print(f"\n  Dropping the verified OpenCode 1 copy...")
+        drop_v1_copy(cx, v1_drop)
 
     # Tool-output cleanup
     if tool_dir and args.tool_output:
@@ -777,12 +1082,17 @@ def run_prune(args):
 
     # Verification — sample random sessions
     print(f"\n  Verifying {min(10, args.keep + 5)} random sessions...", flush=True)
-    passed, failed, verify_details = verify_sessions(cx, sample_size=10)
+    passed, failed, verify_details = verify_sessions(cx, layout, sample_size=10)
 
     # Final stats
-    sessions = cx.execute("select count(*) from session").fetchone()[0]
-    messages = cx.execute("select count(*) from message").fetchone()[0]
-    parts = cx.execute("select count(*) from part").fetchone()[0]
+    if layout["v2"]:
+        sessions = cx.execute("select count(*) from session_v2").fetchone()[0]
+        messages = cx.execute("select count(*) from session_message").fetchone()[0]
+        parts = 0
+    else:
+        sessions = cx.execute("select count(*) from session").fetchone()[0]
+        messages = cx.execute("select count(*) from message").fetchone()[0]
+        parts = cx.execute("select count(*) from part").fetchone()[0]
     cx.close()
 
     size_after = os.path.getsize(db)
@@ -794,7 +1104,10 @@ def run_prune(args):
     print(f"  verification : {passed} passed, {failed} failed")
     if verify_details:
         print(verify_details)
-    print(f"\n  still there  : {sessions:,} sessions, {messages:,} messages, {parts:,} parts")
+    if layout["v2"]:
+        print(f"\n  still there  : {sessions:,} sessions, {messages:,} messages")
+    else:
+        print(f"\n  still there  : {sessions:,} sessions, {messages:,} messages, {parts:,} parts")
     print(f"  size         : {human(size_before)} -> {human(size_after)}")
     print(f"  reclaimed    : {human(size_before - size_after)}")
     print(f"{'='*60}\n")
@@ -825,6 +1138,7 @@ examples:
   %(prog)s --apply --tool-output    also clean tool-output/
   %(prog)s --apply --tool-output --max-age 30
   %(prog)s --schedule 6h            run every 6 hours
+  %(prog)s --apply --drop-v1-copy   OpenCode 2: drop the verified OpenCode 1 copy
 """)
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     ap.add_argument("--apply", action="store_true",
@@ -841,6 +1155,9 @@ examples:
                     help="also clean the tool-output directory")
     ap.add_argument("--max-age", type=int, metavar="DAYS",
                     help="only delete tool-output files older than N days")
+    ap.add_argument("--drop-v1-copy", action="store_true",
+                    help="OpenCode 2: remove the OpenCode 1 copy of sessions verified "
+                         "to be complete in the OpenCode 2 tables")
     ap.add_argument("--force-synced", action="store_true",
                     help="also prune synced/owned aggregates (risky)")
     ap.add_argument("--no-backup", action="store_true",
