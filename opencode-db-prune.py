@@ -58,13 +58,16 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 
 # Event types that are redundant copies of state stored in message/part tables.
 REDUNDANT = ("message.updated.1", "message.part.updated.1", "session.updated.1")
 
 # Default batch size for incremental deletion.
 DEFAULT_BATCH = 10000
+
+# How many texts or sessions the pre-flight check samples.
+PREFLIGHT_SAMPLE = 8
 
 # Tables that indicate sync/workspace ownership — aggregates in these should
 # not be compacted without explicit override.
@@ -291,39 +294,90 @@ def v2_session_has_text(cx, session):
     return bool(row)
 
 
+def v1_session_has_text(cx, session):
+    """Does an OpenCode 1 session have at least one readable text part?"""
+    row = cx.execute(
+        "select 1 from part where message_id in "
+        "(select id from message where session_id=?) "
+        "and json_extract(data,'$.type')='text' "
+        "and length(json_extract(data,'$.text')) > 0 limit 1",
+        (session,)).fetchone()
+    return bool(row)
+
+
+def spread(items, n):
+    """Up to n items taken evenly from first to last."""
+    if len(items) <= n:
+        return list(items)
+    return [items[i * (len(items) - 1) // (n - 1)] for i in range(n)]
+
+
+def sample_event_texts(cx, n=PREFLIGHT_SAMPLE):
+    """Text parts recorded in `event`, taken from n points across the table.
+
+    Only parts of sessions that still exist: deleting a session leaves its
+    events behind, and those have nothing left to compare against.
+    Returns a list of part ids.
+    """
+    lo, hi = cx.execute("select min(rowid), max(rowid) from event").fetchone()
+    if lo is None:
+        return []
+    found = []
+    for i in range(n):
+        start = lo + (hi - lo) * i // n
+        row = cx.execute(
+            "select json_extract(e.data,'$.part.id') from event e "
+            "where e.rowid >= ? and e.type='message.part.updated.1' "
+            "and json_extract(e.data,'$.part.type')='text' "
+            "and length(json_extract(e.data,'$.part.text')) > 0 "
+            "and exists (select 1 from session s where s.id=e.aggregate_id) "
+            "order by e.rowid limit 1", (start,)).fetchone()
+        if row and row[0] and row[0] not in found:
+            found.append(row[0])
+    return found
+
+
 def content_survives_outside_event(cx, layout):
     """Verify the final message content lives outside `event`.
 
     This is the authorization check. If content is only in `event`, the tool
     refuses to run. OpenCode 1 keeps it in `part`; OpenCode 2 in
     `session_message`.
+
+    A single session proves nothing either way: a short or aborted one can
+    have no text at all. So the check samples across the whole database.
     """
     if layout["v2"]:
-        row = cx.execute(
+        ids = [r[0] for r in cx.execute(
             "select v.id from session_v2 v where exists "
             "(select 1 from session_message m where m.session_id=v.id) "
-            "order by v.time_created asc limit 1").fetchone()
-        if not row:
+            "order by v.time_created asc")]
+        if not ids:
             return True, "database has no OpenCode 2 sessions"
-        ok = v2_session_has_text(cx, row[0])
-        return ok, f"oldest session: text {'present' if ok else 'MISSING'} in session_message"
+        sample = spread(ids, PREFLIGHT_SAMPLE)
+        with_text = sum(1 for s in sample if v2_session_has_text(cx, s))
+        # Sessions with only tool calls have no text; none at all means the
+        # content is not where this tool expects it.
+        return with_text > 0, (f"{with_text} of {len(sample)} sampled sessions "
+                               f"have text in session_message")
 
-    row = cx.execute(
-        "select id from session order by time_created asc limit 1").fetchone()
-    if not row:
+    if not cx.execute("select 1 from session limit 1").fetchone():
         return True, "database has no sessions"
-    session = row[0]
-    parts = cx.execute(
-        "select count(*) from part where message_id in "
-        "(select id from message where session_id=?)", (session,)).fetchone()[0]
-    text = cx.execute(
-        "select json_extract(data,'$.text') from part where message_id in "
-        "(select id from message where session_id=?) "
-        "and json_extract(data,'$.type')='text' "
-        "and length(json_extract(data,'$.text')) > 20 limit 1",
-        (session,)).fetchone()
-    ok = parts > 0 and text and text[0]
-    return bool(ok), f"oldest session: {parts} parts, text {'present' if ok else 'MISSING'}"
+    texts = sample_event_texts(cx) if layout["has_event"] else []
+    if not texts:
+        # No text in `event` to lose. Still make sure `part` holds text.
+        row = cx.execute(
+            "select 1 from part where json_extract(data,'$.type')='text' "
+            "and length(json_extract(data,'$.text')) > 0 limit 1").fetchone()
+        return bool(row), ("no text in event; part holds text" if row else
+                           "no text found in part")
+    in_part = sum(1 for part_id in texts if cx.execute(
+        "select 1 from part where id=? and length(json_extract(data,'$.text')) > 0",
+        (part_id,)).fetchone())
+    # A part removed later (undo, revert) is gone from `part` on purpose, so a
+    # few misses are normal. Most of them missing means `part` is not kept.
+    return in_part * 2 >= len(texts), (f"{in_part} of {len(texts)} texts sampled "
+                                       f"from event are also in part")
 
 
 # ---------------------------------------------------------------------------
@@ -732,80 +786,43 @@ def drop_v1_copy(cx, sessions):
 # Post-prune verification
 # ---------------------------------------------------------------------------
 
-def verify_sessions(cx, layout, sample_size=5):
-    """Verify random sessions still have readable content after pruning.
+def pick_verify_sample(cx, layout, sample_size=10):
+    """Random sessions that have readable text before pruning.
+
+    They are checked again afterwards. Sessions without any text (only tool
+    calls, or aborted) are skipped: they have nothing to lose.
+    """
+    table = "session_v2" if layout["v2"] else "session"
+    has_text = v2_session_has_text if layout["v2"] else v1_session_has_text
+    ids = [r[0] for r in cx.execute(f"select id from {table}")]
+    random.shuffle(ids)
+    sample = []
+    for session_id in ids[:sample_size * 5]:
+        if has_text(cx, session_id):
+            sample.append(session_id)
+            if len(sample) == sample_size:
+                break
+    return sample
+
+
+def verify_sessions(cx, layout, sample):
+    """Check that the sessions picked before pruning still have their text.
 
     Returns (passed, failed, details).
     """
-    if layout["v2"]:
-        return verify_v2_sessions(cx, sample_size)
-
-    all_sessions = cx.execute(
-        "select id from session order by time_created desc").fetchall()
-    if not all_sessions:
-        return 0, 0, "no sessions to verify"
-
-    sample = random.sample(all_sessions, min(sample_size, len(all_sessions)))
+    if not sample:
+        return 0, 0, "no sessions with text to verify"
+    has_text = v2_session_has_text if layout["v2"] else v1_session_has_text
     passed = 0
     failed = 0
     details = []
-
-    for (session_id,) in sample:
-        msg_count = cx.execute(
-            "select count(*) from message where session_id=?",
-            (session_id,)).fetchone()[0]
-        part_count = cx.execute(
-            "select count(*) from part where message_id in "
-            "(select id from message where session_id=?)",
-            (session_id,)).fetchone()[0]
-        # Check at least one text part is readable
-        text = cx.execute(
-            "select json_extract(data,'$.text') from part where message_id in "
-            "(select id from message where session_id=?) "
-            "and json_extract(data,'$.type')='text' "
-            "and length(json_extract(data,'$.text')) > 0 limit 1",
-            (session_id,)).fetchone()
-
-        if msg_count > 0 and part_count > 0 and text:
+    for session_id in sample:
+        if has_text(cx, session_id):
             passed += 1
-            details.append(f"  {session_id[:8]}... {msg_count} msgs, {part_count} parts: OK")
-        elif msg_count == 0:
-            # Empty session — not a failure
-            passed += 1
-            details.append(f"  {session_id[:8]}... empty session: OK")
+            details.append(f"  {session_id[:12]}... text still readable: OK")
         else:
             failed += 1
-            details.append(
-                f"  {session_id[:8]}... {msg_count} msgs, {part_count} parts, "
-                f"text={'yes' if text else 'NO'}: FAILED")
-
-    return passed, failed, "\n".join(details)
-
-
-def verify_v2_sessions(cx, sample_size=5):
-    """OpenCode 2 version of verify_sessions: content lives in session_message."""
-    all_sessions = cx.execute(
-        "select id from session_v2 order by time_created desc").fetchall()
-    if not all_sessions:
-        return 0, 0, "no sessions to verify"
-
-    sample = random.sample(all_sessions, min(sample_size, len(all_sessions)))
-    passed = 0
-    failed = 0
-    details = []
-    for (session_id,) in sample:
-        msg_count = cx.execute(
-            "select count(*) from session_message where session_id=? "
-            "and type in ('user','assistant')", (session_id,)).fetchone()[0]
-        if msg_count == 0:
-            passed += 1
-            details.append(f"  {session_id[:12]}... empty session: OK")
-        elif v2_session_has_text(cx, session_id):
-            passed += 1
-            details.append(f"  {session_id[:12]}... {msg_count} msgs: OK")
-        else:
-            failed += 1
-            details.append(f"  {session_id[:12]}... {msg_count} msgs, text=NO: FAILED")
+            details.append(f"  {session_id[:12]}... text no longer readable: FAILED")
     return passed, failed, "\n".join(details)
 
 
@@ -904,7 +921,11 @@ def run_prune(args):
     ok, detail = content_survives_outside_event(cx, layout)
     print(f"  pre-flight: {detail}")
     if not ok:
-        print("\n  REFUSED: message content not readable outside event table.")
+        print("\n  REFUSED: message content not readable outside event table.\n"
+              "  Deleting events could lose text that OpenCode shows from them.\n"
+              "  Nothing was changed. Please open an issue with the pre-flight\n"
+              "  line above and the output of --stats:\n"
+              "  https://github.com/ANGELBERRIOS23/opencode-db-prune/issues")
         cx.close()
         return 3
 
@@ -1053,6 +1074,9 @@ def run_prune(args):
         cx.close()
         return 5
 
+    # Sessions to check again once pruning is done
+    verify_sample = pick_verify_sample(cx, layout)
+
     # Incremental deletion in batches
     if layout["has_event"]:
         print(f"\n  Deleting events (batch size: {args.batch:,})...")
@@ -1080,9 +1104,9 @@ def run_prune(args):
     print("  integrity check (post) ...", flush=True)
     status = cx.execute("pragma integrity_check").fetchone()[0]
 
-    # Verification — sample random sessions
-    print(f"\n  Verifying {min(10, args.keep + 5)} random sessions...", flush=True)
-    passed, failed, verify_details = verify_sessions(cx, layout, sample_size=10)
+    # Verification — the sessions sampled before pruning
+    print(f"\n  Verifying {len(verify_sample)} random sessions...", flush=True)
+    passed, failed, verify_details = verify_sessions(cx, layout, verify_sample)
 
     # Final stats
     if layout["v2"]:

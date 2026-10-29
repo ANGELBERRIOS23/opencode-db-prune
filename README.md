@@ -12,7 +12,7 @@ without deleting a single session, message or file part.
 
 ```
 ============================================================
- opencode-db-prune v3.0.0
+ opencode-db-prune v3.0.1
 ============================================================
 
   database : /home/you/.local/share/opencode/opencode.db
@@ -118,8 +118,10 @@ waste). This tool now detects and reports these.
 
 **1. The content lives somewhere else.** The final state of every message is in
 the `message` and `part` tables (`session_message` in OpenCode 2). The script verifies this before touching
-anything: it opens the oldest session in your database and checks its text is
-still readable outside `event`. If it isn't, it refuses to run.
+anything: it takes texts from points across the whole `event` log and checks
+that the same parts are in `part` (in OpenCode 2, that sessions across the
+database have their text in `session_message`). If they aren't, it refuses to
+run.
 
 **2. OpenCode wipes this table itself.** Its own schema migration
 `reset_v2_session_state` executes:

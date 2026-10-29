@@ -86,9 +86,10 @@ cuyos datos se anotaron antes de la limpieza y comparándolos uno a uno.
 ## Por qué es seguro borrarlo
 
 **1. El contenido vive en otro sitio.** El estado definitivo de cada mensaje está
-en las tablas `message` y `part` (en OpenCode 2, `session_message`). El script lo verifica antes de tocar nada: abre
-la sesión más antigua de tu base y comprueba que su texto siga siendo legible
-fuera de `event`. Si no lo estuviera, se niega a ejecutarse.
+en las tablas `message` y `part` (en OpenCode 2, `session_message`). El script lo verifica antes de tocar nada: toma
+textos de distintos puntos de toda la tabla `event` y comprueba que esas mismas
+partes estén en `part` (en OpenCode 2, que sesiones de toda la base tengan su
+texto en `session_message`). Si no lo estuvieran, se niega a ejecutarse.
 
 **2. OpenCode borra esa tabla él mismo.** Su propia migración de esquema
 `reset_v2_session_state` ejecuta:
